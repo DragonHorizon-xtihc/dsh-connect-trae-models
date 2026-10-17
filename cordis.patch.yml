@@ -1,0 +1,4 @@
+# 注册 Trae Connect Models 模型池供应商：多个 Trae 账号聚合为一个可自动容错换号的 provider。
+- insert:
+    - id: llm-connect-trae-models
+      name: dsh-connect-trae-models
