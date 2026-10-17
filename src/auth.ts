@@ -2,7 +2,7 @@
  * Trae 凭据模型与多账号凭据存储（改编自 dsh-connect-trae/src/auth.ts）。
  *
  * 与单账号版的关键差异：
- * - 去掉「单账号 selected 绑定」语义：xdpool 需要全部账号同时入池，不保存
+ * - 去掉「单账号 selected 绑定」语义：本插件需要全部账号同时入池，不保存
  *   选择状态，`readAll` 仍按 traeAccountId=sha256(edition+userId) 去重、
  *   取每账号最新凭据。
  * - 保留插件自有副本的读取：池内账号刷新后的 token 写入自有副本文件，扫描时
