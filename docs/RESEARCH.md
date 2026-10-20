@@ -213,8 +213,8 @@ WorkBuddy 有一整套成长中心，Trae 完全没有对应端点族：
 
 ## 6. 引用来源
 
-- 本地实测：同系列 `dsh-connect-trae` 插件的 `docs/USAGE_API_RESEARCH.md`（接口路径、字段、业务码、幂等、设备口径全部来源）
-- 本地参照：同系列 `dsh-workbuddy-xdpool` 插件的 `src/upstream.ts`（签到端点、成长中心 `/activity/growth/*`、`/v2/report`、任务领取）与 `src/scheduler.ts`（自动化 job 与事件链）
+- 本地实测：`D:/ClaudeCode/deepseek-harness/plugins/dsh-connect-trae/docs/USAGE_API_RESEARCH.md`（接口路径、字段、业务码、幂等、设备口径全部来源）
+- 本地参照：`D:/ClaudeCode/deepseek-harness/plugins/dsh-workbuddy-xdpool/src/upstream.ts`（签到 1342-1391、成长中心 /activity/growth/*、/v2/report、任务领取 2017-2054）、`src/scheduler.ts`（五类自动化 job 与事件链）
 - 官方文档（2026-10-11 核对）：docs.trae.cn《套餐与计费》（积分类型/获取途径/消耗顺序/签到 FAQ）、《TRAE "邀请新用户得积分"活动》
 - 官方定价页：www.trae.cn/pricing（套餐积分与"签到多得 3000"行）
 - 官方社区检索（forum.trae.cn/search.json，2026-10-11）：签到面额变更帖 179650/181043/182778/350662、设备名额帖 173038/305291、send_message_reward 到账帖 346110、monthly_bonus 到账帖 315074/178806/354635、网页端无签到入口帖 182962/306953、自动签到实践帖 180147/182888/183186

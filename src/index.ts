@@ -426,37 +426,77 @@ export function apply(ctx: Context, config: TraePoolConfig = {} as TraePoolConfi
   }
 
   /**
+   * 重试一次目录读取。
+   *
+   * 网关对目录端点会间歇性回 401（dsh-connect-trae 2026-09-15 实测：同一份凭据
+   * 秒后即回 200），一次瞬时拒绝不该把整份实时目录打回静态回退。
+   */
+  const withDirectoryRetry = async <T>(read: () => Promise<T>): Promise<T> => {
+    try {
+      return await read()
+    } catch (first: unknown) {
+      await new Promise(resolve => setTimeout(resolve, 800))
+      try {
+        return await read()
+      } catch {
+        throw first
+      }
+    }
+  }
+
+  /**
    * 播种某一区域的实时模型目录。
    *
    * 两个区域互相隔离且各自独立重试：它们是不同主机上的不同网关，一个不可达
    * 绝不能拖累另一个。静态回退名册保证上游离线时 provider 永不为空。
+   *
+   * 区域内逐账号尝试：池里任一账号的凭据都可能已被上游吊销（401），而播种只
+   * 需要一个健康账号。只赌队首会让一份死 token 拖垮整个区域的实时目录。
    */
   const seedRegion = async (
     region: TraeRegion,
-    accounts: readonly { credential: { edition: string; userId: string; host?: string } }[],
+    accounts: readonly { id: string; credential: { edition: string; userId: string; host?: string } }[],
   ): Promise<void> => {
     if (identity === undefined) {
       ctx.logger.warn?.(`dsh-connect-trae-models: 本机身份不可用，跳过 ${region} 目录播种（保持静态回退）`)
       return
     }
-    const account = accounts.find(candidate => regionOfCredential(candidate.credential as never) === region)
-    if (account === undefined) {
+    const candidates = accounts.filter(candidate => regionOfCredential(candidate.credential as never) === region)
+    if (candidates.length === 0) {
       ctx.logger.info?.(`dsh-connect-trae-models: 尚无 ${region} 账号；保留静态 ${region} 目录`)
       return
     }
-    const request = { credential: account.credential as never, identity }
-    try {
-      const wire = await core.client.fetchModels(request)
-      const remote = await core.client.fetchRemoteCatalog(request)
-      const merged = core.client.mergeCatalog(remote, wire)
-      core.catalogs[region].updateFromUpstream(merged)
-      ctx.logger.info?.(`dsh-connect-trae-models: ${region} 目录已播种 ${merged.length} 个模型`)
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error)
-      core.catalogs[region].noteFetchFailure(message)
-      ctx.logger.warn(`dsh-connect-trae-models: ${region} 模型目录不可用；使用静态回退`, error)
+    const failures: string[] = []
+    for (const account of candidates) {
+      // 临近过期的 token 先续期；不在余量内时这是空操作（ensureFresh 语义）。
+      // 刷新若证明凭据已死，返回 false，本循环直接跳到下一个账号。
+      if (!await core.pool.refreshAccount(account.id)) {
+        failures.push(`${account.id}: 凭据已失效（刷新被上游拒绝）`)
+        continue
+      }
+      const request = { credential: account.credential as never, identity }
+      try {
+        const wire = await withDirectoryRetry(() => core.client.fetchModels(request))
+        const remote = await withDirectoryRetry(() => core.client.fetchRemoteCatalog(request))
+        const merged = core.client.mergeCatalog(remote, wire)
+        core.catalogs[region].updateFromUpstream(merged)
+        ctx.logger.info?.(`dsh-connect-trae-models: ${region} 目录已播种 ${merged.length} 个模型`)
+        // 施加选择放在播种之后：目录刚换成实时数据，之前的选择要重新贴合。
+        applyConfigFromSource()
+        return
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error)
+        failures.push(`${account.id}: ${message}`)
+        ctx.logger.warn(
+          `dsh-connect-trae-models: ${region} 账号 ${account.id} 目录播种失败，尝试下一个账号`,
+          error,
+        )
+      }
     }
-    // 施加选择放在播种之后：目录刚换成实时数据，之前的选择要重新贴合。
+    const message = failures.join(' | ')
+    core.catalogs[region].noteFetchFailure(message)
+    ctx.logger.warn(`dsh-connect-trae-models: ${region} 模型目录不可用；使用静态回退`, message)
+    // 全部账号失败时也要重新贴合选择：目录可能刚从实时退回静态。
     applyConfigFromSource()
   }
 

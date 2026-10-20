@@ -268,16 +268,30 @@ export class TraeCredentialStore {
     for (const candidate of this.candidates()) {
       try {
         const credential = this.credentialFrom(candidate, await readFile(candidate.path, 'utf8'))
-        // 同一账号（region+userId 相同）的多个桌面候选，保留 token 有效期更晚的
-        // 那份：同一个人常同时登录 Trae CN 与 TRAE SOLO CN 两个客户端，而两个
-        // 安装的 token 刷新节奏不同，留旧的那个会让账号显示「即将过期」甚至
-        // 「已过期」，而有效 token 就躺在隔壁文件里。
+        // 同一账号（region+userId 相同）的多个候选只留一份。
         //
-        // 只做「查重」是不够的（那等于永远保留第一个遇到的候选，把更新的一份
-        // 静默丢掉）——必须比较 expiresAtMs。
+        // 规则一（先判）：桌面凭据压过 CLI 凭据。`~/.trae-cn/trae-jwt-token` 是
+        // Trae CLI 某次登录留下的裸 JWT，服务端吊销之后文件不会被改写，而它自带
+        // 的 `exp` 仍指向未来 —— 实测该凭据在 get_detail_param 上回
+        // `401 / 1001 not able to authenticate you`，而桌面 storage.json 里同一个
+        // userId 的 token 正常 200。按有效期比较会让这份「看起来更新」的死 token
+        // 顶掉 App 的实时登录，账号随即被上游判死（目录 401、积分 401），整个
+        // 区域的实时目录降级成静态回退。
+        //
+        // 规则二：同为桌面候选时才保留有效期更晚的那份 —— 同一个人常同时登录
+        // Trae CN 与 TRAE SOLO CN 两个客户端，两个安装的 token 刷新节奏不同，
+        // 留旧的那个会让账号显示「即将过期」而有效 token 就躺在隔壁文件里。
         const existing = credentials.find(entry => traeAccountId(entry) === traeAccountId(credential))
-        if (existing === undefined) credentials.push(credential)
-        else if (credential.expiresAtMs > existing.expiresAtMs) {
+        if (existing === undefined) {
+          credentials.push(credential)
+          continue
+        }
+        if (credential.source === 'cli' && existing.source === 'desktop') continue
+        if (existing.source === 'cli' && credential.source === 'desktop') {
+          credentials[credentials.indexOf(existing)] = credential
+          continue
+        }
+        if (credential.expiresAtMs > existing.expiresAtMs) {
           credentials[credentials.indexOf(existing)] = credential
         }
       } catch (error: unknown) {
