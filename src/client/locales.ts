@@ -174,7 +174,7 @@ export const en = {
 
 /** Card copy in Chinese; key set mirrors {@link en} exactly. */
 export const zh: Record<keyof typeof en, string> = {
-  'row.navLabel': 'XD 账号池',
+  'row.navLabel': 'Trae 模型',
   'row.title': 'Trae Connect Models（dsh-connect-trae-models）',
   'row.desc': '把本机所有 Trae 登录聚合成一个自动容错换号的模型池接入 DSH。',
   'row.loading': '加载中…',
