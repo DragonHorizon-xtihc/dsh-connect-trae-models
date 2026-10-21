@@ -2,7 +2,7 @@
   "name": "dsh-connect-trae-models",
   "displayName": "DSH Connect Trae Models",
   "description": "把多个 Trae 账号聚合成一个自动容错换号的模型池：多账号轮转、手动签到、积分自动化、模型/积分包到期提醒与可选模型配置页面。",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT",
   "author": "DragonHorizon-xtihc",
   "repository": {
