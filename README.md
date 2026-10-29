@@ -1,5 +1,9 @@
 # DSH Connect Trae Models
 
+[![npm version](https://img.shields.io/npm/v/dsh-connect-trae-models.svg)](https://www.npmjs.com/package/dsh-connect-trae-models)
+[![npm downloads](https://img.shields.io/npm/dm/dsh-connect-trae-models.svg)](https://www.npmjs.com/package/dsh-connect-trae-models)
+[![license](https://img.shields.io/npm/l/dsh-connect-trae-models.svg)](./LICENSE)
+
 多账号 Trae 模型池插件：把本机所有 Trae 登录态聚合成 DeepSeek Harness 里的**一个模型供应商**，
 请求在账号池内自动容错换号，并配套手动/自动签到、模型倍率显示、账号使用方式切换（自动轮转 +
 手动钉号）与可选模型配置页面。
@@ -118,7 +122,9 @@
 前置条件：装好 **Trae 客户端**并登录（插件复用它存在本机的登录态，从不索要密码）。
 多账号 = 在客户端里换着登几次。
 
-**方式一：从 npm 安装（发布后可用）**
+**方式一：从 npm 安装（推荐）**
+
+包已发布在 npm：[`dsh-connect-trae-models`](https://www.npmjs.com/package/dsh-connect-trae-models)
 
 ```sh
 # dsh 不在 PATH 时，用 node ~/.dsh/profiles/node_modules/@deepseek-ai/dsh/lib/bin.js 代替 dsh
