@@ -93,8 +93,11 @@ describe('applyModelBudget 预算上下界', () => {
     expect(applyModelBudget(model, 900_000).contextWindow).toBe(900_000)
   })
 
-  it('绝不越过 Max 上限（不虚构窗口）', () => {
+  it('绝不越过 Max 上限（超限预算夹到 Max，绝不虚构窗口）', () => {
+    // 夹紧而不是作废：作废会把窗口收回默认档，而收窄正是 silent overflow 的
+    // 危险方向（pi-ai 用 usage.input > contextWindow 事后判定）。
     expect(applyModelBudget(model, 5_000_000).contextWindow).toBe(1_000_000)
+    expect(applyModelBudget(model, 1_000_001).contextWindow).toBe(1_000_000)
   })
 
   it('未宣告 Max 档时上限就是当前窗口', () => {
@@ -103,10 +106,17 @@ describe('applyModelBudget 预算上下界', () => {
     expect(applyModelBudget(plain, 100_000).contextWindow).toBe(100_000)
   })
 
-  it('非法预算原样返回（0 / 负数 / NaN / 未设置）', () => {
-    for (const budget of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(applyModelBudget(model, budget)).toBe(model)
+  it('非法预算（0 / 负数 / NaN / Infinity）回退默认策略', () => {
+    // 非法值不作废成「不申报」：那会让 DSH 以 INVALID_MODEL_CONTEXT 拒掉整条
+    // 路由。回退默认策略（Max 1M > 500K → 500K）是可解释的安全落点。
+    for (const budget of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(applyModelBudget(model, budget).contextWindow).toBe(500_000)
     }
+  })
+
+  it('未设置预算 = 默认策略（不是「保持 dev 档」）', () => {
+    // 这正是本次事故的正解：带 1M Max 档的模型默认申报 500K，而不是钉死在 dev。
+    expect(applyModelBudget(model, undefined).contextWindow).toBe(500_000)
   })
 
   it('小数预算向下取整', () => {
@@ -265,6 +275,29 @@ describe('TraeCatalog selection：enabled / image / contextBudget', () => {
 
     catalog.applySelection({ enabledModelIds: [] })
     expect(catalog.visible()).toEqual([])
+  })
+
+  it('all() 不受启用列表影响：停用行仍然在列表里（卡片要把它们勾回来）', () => {
+    const catalog = seeded()
+
+    catalog.applySelection({ enabledModelIds: ['a'] })
+    expect(catalog.all().map(model => model.id)).toEqual(['a', 'b', 'c'])
+    expect(catalog.visible().map(model => model.id)).toEqual(['a'])
+
+    // 全部停用：visible 空，但 all 仍然完整——这是「取消全选」可逆的前提。
+    catalog.applySelection({ enabledModelIds: [] })
+    expect(catalog.all().map(model => model.id)).toEqual(['a', 'b', 'c'])
+    expect(catalog.visible()).toEqual([])
+  })
+
+  it('all() 仍然套用图片 opt-in 与上下文预算', () => {
+    const catalog = seeded()
+    catalog.applySelection({ imageModelIds: ['a'], contextBudgets: { b: 100_000 } })
+    const byId = new Map(catalog.all().map(model => [model.id, model]))
+
+    expect(byId.get('a')?.supportsImages).toBe(true)
+    expect(byId.get('b')?.contextWindow).toBe(100_000)
+    expect(byId.get('c')?.supportsImages).toBe(true)
   })
 
   it('image opt-in 只影响被点名的行', () => {

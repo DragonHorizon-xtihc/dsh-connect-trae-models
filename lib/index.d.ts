@@ -25,8 +25,23 @@ interface TraeDiscoveredModel {
   id: string;
   name: string;
   multimodal: boolean;
+  /** dev 档窗口（`context_window_tokens.dev`）。 */
   contextWindow?: number;
+  /**
+   * Max 档窗口（`context_window_tokens.max`）。
+   *
+   * **只要有值就解析出来，与 `max_mode` 无关。** 曾经这里用
+   * `raw.max_mode === true` 做门槛，导致上游在 `max_mode: false` 时宣告的 1M
+   * 窗口被静默丢弃，目录退化成 dev 档，最终由 pi-ai 的 silent-overflow 判定
+   * 把成功的响应判成溢出（`docs/CONTEXT_OVERFLOW_ROOTCAUSE.md`）。
+   */
   maxContextWindow?: number;
+  /**
+   * `max_mode` 原始标志：它只描述「该 Max 档是否可计费使用」，**不是窗口存在
+   * 与否的门槛**。保留它是为了不把这条上游信息悄悄丢掉，窗口值本身永远走
+   * {@link maxContextWindow}。
+   */
+  maxMode?: boolean;
   creditMultiplier?: number;
   reasoningSupported: boolean;
   reasoning?: TraeDiscoveredReasoning;
@@ -86,6 +101,16 @@ declare function regionOfCredential(credential: {
   region?: string;
 }): TraeRegion;
 //#endregion
+//#region src/context-window.d.ts
+/**
+ * 两个来源（远端目录 / `get_detail_param`）都没报窗口时的兜底值。
+ *
+ * 没有窗口的模型会让 DSH 以 `INVALID_MODEL_CONTEXT` 拒绝**整条** provider
+ * 路由，比一个不精确的窗口严重得多。放在这个 node-free 模块里，是因为
+ * {@link defaultContextWindow} 需要它，而 catalog.ts 反过来 import 本模块。
+ */
+declare const TRAE_DEFAULT_CONTEXT_WINDOW = 200000;
+//#endregion
 //#region src/catalog.d.ts
 /** 模型的一种输入模态。 */
 type TraeInputModality = 'text' | 'image';
@@ -99,6 +124,15 @@ interface TraeModelInfo {
   name: string;
   /** 生效上下文窗口。目录保证必有正值：DSH 拒绝无窗口模型会拖垮整条 provider 路由。 */
   contextWindow: number;
+  /**
+   * 上游宣告的 dev 档窗口。
+   *
+   * `contextWindow` 会被用户预算覆盖，而**档位列表必须从 dev 档算起**——否则
+   * 用户把 1M 压到 128K 之后，卡片只能看到 `[128K, 500K, 1M]` 里的后两档，
+   * 「回到 dev 档」这个选项就消失了。缺省表示「`contextWindow` 就是 dev 档」
+   * （未叠加预算时的常态）。
+   */
+  devContextWindow?: number;
   /** 单次输出的 token 上限；上游目录偶有缺省。 */
   maxOutputTokens?: number;
   /** 积分倍率（折后价，如 0.08 → 「 · x0.08」）。 */
@@ -119,11 +153,11 @@ interface TraeModelInfo {
   wireFunction?: string;
 }
 /**
- * 目录保证的默认窗口。两个来源（远端目录/get_detail_param）都没报窗口的
- * 罕见模型用它兜底：没有窗口的模型会让 DSH 整条 provider 路由
- * `INVALID_MODEL_CONTEXT` 失败，比一个不精确的窗口严重得多。
+ * 目录保证的默认窗口。
+ *
+ * 定义搬到 `context-window.ts`（浏览器半端也要用同一份算术），这里保留导出以
+ * 维持既有公开 API：`index.ts` 与测试都从本模块取它。
  */
-declare const TRAE_DEFAULT_CONTEXT_WINDOW = 200000;
 /**
  * CN 回退名册（照抄 dsh-connect-trae catalog.ts，字段已实测核对）：
  * - id 必须是 `llm_utils_chat` 真正接受的 config_name（CN 的 DeepSeek 行带
@@ -194,8 +228,20 @@ interface ModelSelection {
 type TraeContextBudget = number;
 /**
  * 应用单个模型的上下文预算。
- * 规则：预算必须落在 (0, 广告窗口上限] 内——上限 = maxContextWindow（若有）
- * 否则当前窗口。可以下调，也可以上调到上游真实宣告的 Max 档，但绝不虚构数值。
+ *
+ * 规则全部收敛在 `context-window.ts`（宿主与卡片共用同一份算术）：
+ * - 合法预算（正整数且不宽于该模型的 Max 档）→ 用预算；
+ * - 未设置或非法 → 默认策略（{@link defaultContextWindow}）。
+ *
+ * **默认策略本身就是一次抬升**：带 1M Max 档的模型默认申报 500K，带 272K Max
+ * 的模型默认申报 272K，绝不再无条件钉死在 dev 档的 200K。这是本次 silent
+ * overflow 事故的正解——旧实现只能在 `maxContextWindow ?? contextWindow` 以内
+ * 下调，而 Max 档因解析门槛恒为 undefined，于是「20 万硬顶、必死」。
+ *
+ * 档位列表（`contextBudgetOptions`）是**建议值**，不是白名单：合法预算只要不宽于
+ * Max 档就照用（例如用户填 300000，即便它不在 `[200000, 500000, 1000000]` 里），
+ * 因为预算的本意是「在这台机器上少花 token」，收窄永远安全；危险方向是超出
+ * 上游真实窗口，而那由 {@link resolveContextBudget} 夹到 Max 档拦下。
  */
 declare function applyModelBudget(model: TraeModelInfo, budget: number | undefined): TraeModelInfo;
 /** 模型目录：live 数据 + 静态回退 + 用户选择。 */
@@ -220,16 +266,24 @@ declare class TraeCatalog {
   /** 当前完整目录（未套用 selection）。 */
   current(): readonly TraeModelInfo[];
   /**
-   * DSH 实际应提供的模型：套用用户选择——停用的模型剔除，显式图片列表与上游
-   * multimodal 标志并集决定图片输入，逐模型预算调整窗口。
+   * 目录里**全部**模型，套用图片 opt-in 与上下文预算，但**不按启用列表过滤**。
    *
-   * 与蓝本 dsh-workbuddy-xdpool 的语义一致：`enabledModelIds` **缺失** = 全部
-   * 可见；空数组则是「用户撤回了每一个模型」这一显式选择，必须照办——所以这里
-   * 不能把空数组也放宽成不筛选。
+   * 这是配置卡片要的数据源：卡片必须能列出「已被停用的行」，否则用户勾掉最后
+   * 一个模型后整个模型区块会连同复选框一起消失，再也没有入口把它勾回来——
+   * 一个只能单向关闭的控件。真正交给 DSH 的仍然是 {@link visible}。
+   */
+  all(): readonly TraeModelInfo[];
+  /**
+   * DSH 实际应提供的模型：套用用户选择——停用的模型剔除。
    *
-   * 真正要防的是空数组被**无意写入**：schema 会把「从未配置」materialize 成
-   * `[]`，那会让模型选择器整个空掉。防它的是写入侧的兜底（见 index.ts 的
-   * applySelection 与卡片保存），不是在这里放宽过滤。
+   * 语义严格区分三种状态（三者不可互相折叠，折叠任何一对都会造出一个撒谎的
+   * 控件，见 `docs/CONTEXT_OVERFLOW_ROOTCAUSE.md` 的同名小节）：
+   * - **缺失** = 用户从未选过 → 全部提供（新安装绝不能给空选择器）；
+   * - **部分列表** = 只提供列表里的；
+   * - **空数组** = 用户显式停用了每一个 → 一个都不提供，必须照办。
+   *
+   * 历史教训：旧实现把空数组也放宽成「不筛选」，于是「全部停用」在服务端根本
+   * 无法生效；同时卡片渲染的是过滤后的列表，两者叠加让停用变成纯装饰。
    */
   visible(): readonly TraeModelInfo[];
   /** 替换目录并通知 adapter 重建模型列表。空列表忽略（绝不接受空目录）。 */
@@ -1130,6 +1184,40 @@ interface TraeAdapter {
   invalidate: () => void;
 }
 /**
+ * 一次路由请求必须为「模型自己的输出」留出的最少消息预算（token）。
+ *
+ * 为什么需要这条下限：`dsh-compaction-basic` 的 `resolveCompactSpec()` 用
+ * `reservedCompletionTokens`（= 本插件写进 `configuredMaxTokens` 的值）从窗口里
+ * 先扣掉输出预留，再扣 `headroomTokens`（默认 65536）得到压力预算，而保留区
+ * `retainTokens = floor(0.16 × (window − reserved))` 必须**小于**压力预算，否则
+ * 它直接抛 `TargetPressureConfigError`，压缩一次都不会发生 —— 那正是本次事故
+ * 里「零 compaction 事件」的现象之一。
+ *
+ * 代入默认参数解这条不等式：`0.84 × (window − reserved) > 65536`，即消息预算
+ * 至少要 78,019。取整到 100,000 留出余量，同时足够宽松：200K 窗口 + 64K 输出
+ * （136K 消息预算）、272K + 72K（200K）、500K + 128K（372K）全部通过；只有
+ * 「输出预留吃掉大半个窗口」的荒谬组合（如 200K + 128K）才会被跳过 —— 跳过时
+ * 退回事故前的行为（不预留、不抛错），绝不制造新的失败模式。
+ */
+declare const TRAE_MIN_MESSAGE_BUDGET_TOKENS = 100000;
+/**
+ * 该模型可以在 `configuredMaxTokens` 里声明多少输出预留。
+ *
+ * `undefined` = 不声明（`dsh-llm` 的 `info.defaultMaxTokens` 保持缺失，
+ * compaction 的 `reservedCompletionTokens` 回落到 0，与修复前一致）。
+ *
+ * 导出是为了让测试直接覆盖这条「预留不能压垮压缩算术」的判定，而不必装配整个
+ * pi-ai adapter（那需要真实的 shim 端口）。
+ */
+declare function safeOutputReservation(info: Pick<TraeModelInfo, 'maxOutputTokens'>, contextWindow: number): number | undefined;
+/**
+ * 目录行 → `configuredMaxTokens` 映射（`dsh-llm` 的 `info.defaultMaxTokens`）。
+ *
+ * 纯函数 + 独立导出：adapter 只负责在每次目录变化时调用它，测试则可以直接断言
+ * 「哪个模型被声明了输出预留、预留是多少」，不必起 shim。
+ */
+declare function configuredMaxTokensFor(models: readonly TraeModelInfo[]): Map<string, number>;
+/**
  * 装配 adapter。`getModels` 重读实时目录，且每个模型的 `baseUrl` 每次读取都
  * 重新解析，使 shim 的临时端口从启动后的第一份快照起就生效。
  * 只在 `shim.ready` 之后调用。
@@ -1281,10 +1369,31 @@ interface TraePoolWebModel {
   enabled: boolean;
   /** 生效的图片输入支持（已叠加用户 opt-in 与上游 multimodal）。 */
   supportsImages: boolean;
-  /** 生效上下文窗口（已叠加用户预算）。 */
+  /** 生效上下文窗口（已叠加用户预算与默认策略）。 */
   contextWindow: number;
-  /** 上游宣告的窗口，未叠加预算。 */
+  /** 上游宣告的窗口，未叠加预算（= Max 档；无 Max 时等于 dev 档）。 */
   nativeContextWindow: number;
+  /**
+   * 上游宣告的 Max 档窗口。
+   *
+   * 与 `nativeContextWindow` 分开暴露的理由：后者在没有 Max 档时会退化成 dev
+   * 档，卡片无法分辨「上游只给了一档」和「Max 恰好等于 dev」。有了这个字段，
+   * 卡片能准确判断该行是否**可抬升**（有 Max 才有档位可选），也能在
+   * `docs/CONTEXT_OVERFLOW_ROOTCAUSE.md` 那类事故里一眼看出「真实窗口 1M、
+   * 当前只申报了 200K」。
+   */
+  maxContextWindow?: number;
+  /**
+   * 该模型可选的全部窗口档位（升序，来自 `context-window.ts` 的
+   * `contextBudgetOptions`）。
+   *
+   * 由宿主算好交给卡片，而不是让卡片自己推：两边算法漂移会造出「卡片给一个
+   * 窗口、宿主却拒绝应用」的静默失效控件。卡片把这些值渲染成输入框的
+   * `datalist` 建议（`<input list=...>`），用户仍可填任意合法预算——档位是
+   * 上游真实提供的档位，不是白名单（见 `catalog.ts` 的 `applyModelBudget`）。
+   * 只有一档时不渲染建议列表，输入框保持自由输入。
+   */
+  budgetOptions?: readonly number[];
   /** 上游宣告的单次输出上限。 */
   maxOutputTokens?: number;
   /** 上游宣告的推理档位。 */
@@ -2225,4 +2334,4 @@ declare function createCore(logger?: {
 declare function apply(ctx: Context, config?: TraePoolConfig): void;
 declare const name = "llm-connect-trae-models";
 //#endregion
-export { AUTOMATION_JOB_KINDS, AUTOMATION_TICK_MS, AUTOMATION_TIME_ZONE, type AutomationAccountEarnings, type AutomationAccountGain, AutomationConfig, type AutomationJobKind, type AutomationJobState, type AutomationLedger, type AutomationOptions, type AutomationStatus, CHECKIN_DEVICE_ALREADY_CLAIMED, type ChatMessage, type CompactOptions, type CompactResult, Config, DEFAULT_CHECKIN_HOURS, EXPIRING_SOON_WINDOW_MS, FALLBACK_TRAE_MODELS, FALLBACK_TRAE_MODELS_AI, type ModelSelection, ModelSelectionConfig, POOL_NAME_BY_REGION, POOL_PROVIDER_BY_REGION, REGION_GATEWAYS, type SchedulerLogger, type ShimLogger, SseDecoder, TRAE_AUTH_FILENAME, TRAE_AUTH_STORAGE_KEY, TRAE_CLI_TOKEN_FILENAME, TRAE_DEFAULT_CONTEXT_WINDOW, TRAE_DEFAULT_COOLDOWN_MS, TRAE_DIRECTORY_FUNCTIONS, TRAE_GLOBAL_POOL_PROVIDER, TRAE_HEARTBEAT_COMMENT, TRAE_KEEPALIVE_INTERVAL_MS, TRAE_POOL_ACCOUNT_TOGGLE_PATH, TRAE_POOL_AUTOMATION_RUN_PATH, TRAE_POOL_CHECKIN_PATH, TRAE_POOL_DEFAULT_REGION, TRAE_POOL_MODELS_SAVE_PATH, TRAE_POOL_PROVIDER, TRAE_POOL_RESCAN_PATH, TRAE_POOL_RESET_COOLDOWN_PATH, TRAE_POOL_ROUTE_PREFIX, TRAE_POOL_SETTINGS_NS, TRAE_POOL_STATUS_PATH, TRAE_PROGRESS_COMMENT, TRAE_QUEUE_COMMENT, TRAE_REASONING_EFFORTS, TRAE_SOLO_CHAT_PATH, TRAE_SOLO_FUNCTION, TRAE_SOLO_MODELS_PATH, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_UPSTREAM_SILENCE_MS, type TraeAccount, TraeAccountPool, type TraeAccountPoolOptions, type TraeActivityRule, type TraeAdapter, type TraeAdapterOptions, type TraeCandidateFailure, TraeCatalog, type TraeChatResult, type TraeCheckinClaim, type TraeCheckinStatus, type TraeCliTokenClaims, type TraeContextBudget, type TraeCredential, type TraeCredentialSource, TraeCredentialStore, type TraeCredentialStoreOptions, type TraeCreditPack, type TraeCreditsSnapshot, type TraeDistribution, type TraeEdition, type TraeIdentity, type TraeIdentityReadOptions, type TraeInputModality, type TraeModelInfo, TraePoolApi, TraePoolConfig, type TraePoolRegion, type TraePoolShim, type TraePoolShimOptions, type TraePoolStatusRouteOptions, type TraePoolWebAccount, type TraePoolWebAccountToggle, type TraePoolWebAutomation, type TraePoolWebAutomationEarnings, type TraePoolWebAutomationJob, type TraePoolWebAutomationRun, type TraePoolWebAutomationRunResult, type TraePoolWebCheckin, type TraePoolWebCheckinClaim, type TraePoolWebCheckinRequest, type TraePoolWebCreditPack, type TraePoolWebCredits, type TraePoolWebModel, type TraePoolWebModelSelection, type TraePoolWebStatus, type TraeRefreshDevice, type TraeRefreshOutcome, TraeScheduler, type TraeStorageCandidate, type TraeTokenRefresher, TraeUpstreamClient, type TraeUpstreamClientOptions, type TraeUpstreamErrorKind, type TraeWireModel, apply, applyModelBudget, bridgeTraeSoloStream, bridgeTraeSoloStreamOrFail, buildTraeHeaders, buildTraePoolWebStatus, chatStream, claimCheckin, classifyTraeError, collectWireModels, compactMessages, compactWithSummary, configReader, contextOverflowMessage, conversationKeyOf, createCore, createTraeAdapter, createTraePoolShim, currentApi, dayKey, decodeTraeEvent, decryptTraeStorageValue, describeTraeFailure, estimateMessagesTokens, estimateTextTokens, fallbackModelsFor, fetchActivities, fetchCheckinStatus, fetchCredits, fetchModels, fetchRemoteCatalog, hardTruncate, identityHeaders, inject, isFireHour, mergeCatalog, mergeTraeModelSources, name, normalizeTraeCredential, normalizeTraeVersionCode, parseActivities, parseCheckinClaim, parseCheckinStatus, parseCreditsSnapshot, parseRateLimitReset, parseReasoningCapability, parseRegionParam, parseSelection, parseTraeAuthValue, parseTraeCliToken, parseTraeRemoteModel, parseTraeStorageDocument, pickTraeStorageIdentity, prepareSoloBody, readTraeCliIdentity, readTraeIdentity, refreshTraeCredential, regionOfCredential, regionOfEdition, regionOfHost, regionOfUserRegion, registerTraePoolStatusRoute, resolveTraeIdentity, safeMessage, setApi, slotKey, stampTraeWireTarget, traeAccountId, traeAccountRegion, traeCliCandidates, traeEndpoint, traeModelDisplayName, traePoolAccountId, traeStorageCandidates, traeWindowsAppNames, unwrapVolatile, unwrapVolatileDeep, wireCreditMultiplier };
+export { AUTOMATION_JOB_KINDS, AUTOMATION_TICK_MS, AUTOMATION_TIME_ZONE, type AutomationAccountEarnings, type AutomationAccountGain, AutomationConfig, type AutomationJobKind, type AutomationJobState, type AutomationLedger, type AutomationOptions, type AutomationStatus, CHECKIN_DEVICE_ALREADY_CLAIMED, type ChatMessage, type CompactOptions, type CompactResult, Config, DEFAULT_CHECKIN_HOURS, EXPIRING_SOON_WINDOW_MS, FALLBACK_TRAE_MODELS, FALLBACK_TRAE_MODELS_AI, type ModelSelection, ModelSelectionConfig, POOL_NAME_BY_REGION, POOL_PROVIDER_BY_REGION, REGION_GATEWAYS, type SchedulerLogger, type ShimLogger, SseDecoder, TRAE_AUTH_FILENAME, TRAE_AUTH_STORAGE_KEY, TRAE_CLI_TOKEN_FILENAME, TRAE_DEFAULT_CONTEXT_WINDOW, TRAE_DEFAULT_COOLDOWN_MS, TRAE_DIRECTORY_FUNCTIONS, TRAE_GLOBAL_POOL_PROVIDER, TRAE_HEARTBEAT_COMMENT, TRAE_KEEPALIVE_INTERVAL_MS, TRAE_MIN_MESSAGE_BUDGET_TOKENS, TRAE_POOL_ACCOUNT_TOGGLE_PATH, TRAE_POOL_AUTOMATION_RUN_PATH, TRAE_POOL_CHECKIN_PATH, TRAE_POOL_DEFAULT_REGION, TRAE_POOL_MODELS_SAVE_PATH, TRAE_POOL_PROVIDER, TRAE_POOL_RESCAN_PATH, TRAE_POOL_RESET_COOLDOWN_PATH, TRAE_POOL_ROUTE_PREFIX, TRAE_POOL_SETTINGS_NS, TRAE_POOL_STATUS_PATH, TRAE_PROGRESS_COMMENT, TRAE_QUEUE_COMMENT, TRAE_REASONING_EFFORTS, TRAE_SOLO_CHAT_PATH, TRAE_SOLO_FUNCTION, TRAE_SOLO_MODELS_PATH, TRAE_STREAM_IDLE_TIMEOUT_MS, TRAE_UPSTREAM_SILENCE_MS, type TraeAccount, TraeAccountPool, type TraeAccountPoolOptions, type TraeActivityRule, type TraeAdapter, type TraeAdapterOptions, type TraeCandidateFailure, TraeCatalog, type TraeChatResult, type TraeCheckinClaim, type TraeCheckinStatus, type TraeCliTokenClaims, type TraeContextBudget, type TraeCredential, type TraeCredentialSource, TraeCredentialStore, type TraeCredentialStoreOptions, type TraeCreditPack, type TraeCreditsSnapshot, type TraeDistribution, type TraeEdition, type TraeIdentity, type TraeIdentityReadOptions, type TraeInputModality, type TraeModelInfo, TraePoolApi, TraePoolConfig, type TraePoolRegion, type TraePoolShim, type TraePoolShimOptions, type TraePoolStatusRouteOptions, type TraePoolWebAccount, type TraePoolWebAccountToggle, type TraePoolWebAutomation, type TraePoolWebAutomationEarnings, type TraePoolWebAutomationJob, type TraePoolWebAutomationRun, type TraePoolWebAutomationRunResult, type TraePoolWebCheckin, type TraePoolWebCheckinClaim, type TraePoolWebCheckinRequest, type TraePoolWebCreditPack, type TraePoolWebCredits, type TraePoolWebModel, type TraePoolWebModelSelection, type TraePoolWebStatus, type TraeRefreshDevice, type TraeRefreshOutcome, TraeScheduler, type TraeStorageCandidate, type TraeTokenRefresher, TraeUpstreamClient, type TraeUpstreamClientOptions, type TraeUpstreamErrorKind, type TraeWireModel, apply, applyModelBudget, bridgeTraeSoloStream, bridgeTraeSoloStreamOrFail, buildTraeHeaders, buildTraePoolWebStatus, chatStream, claimCheckin, classifyTraeError, collectWireModels, compactMessages, compactWithSummary, configReader, configuredMaxTokensFor, contextOverflowMessage, conversationKeyOf, createCore, createTraeAdapter, createTraePoolShim, currentApi, dayKey, decodeTraeEvent, decryptTraeStorageValue, describeTraeFailure, estimateMessagesTokens, estimateTextTokens, fallbackModelsFor, fetchActivities, fetchCheckinStatus, fetchCredits, fetchModels, fetchRemoteCatalog, hardTruncate, identityHeaders, inject, isFireHour, mergeCatalog, mergeTraeModelSources, name, normalizeTraeCredential, normalizeTraeVersionCode, parseActivities, parseCheckinClaim, parseCheckinStatus, parseCreditsSnapshot, parseRateLimitReset, parseReasoningCapability, parseRegionParam, parseSelection, parseTraeAuthValue, parseTraeCliToken, parseTraeRemoteModel, parseTraeStorageDocument, pickTraeStorageIdentity, prepareSoloBody, readTraeCliIdentity, readTraeIdentity, refreshTraeCredential, regionOfCredential, regionOfEdition, regionOfHost, regionOfUserRegion, registerTraePoolStatusRoute, resolveTraeIdentity, safeMessage, safeOutputReservation, setApi, slotKey, stampTraeWireTarget, traeAccountId, traeAccountRegion, traeCliCandidates, traeEndpoint, traeModelDisplayName, traePoolAccountId, traeStorageCandidates, traeWindowsAppNames, unwrapVolatile, unwrapVolatileDeep, wireCreditMultiplier };

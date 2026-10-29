@@ -155,10 +155,31 @@ export interface TraePoolWebModel {
   enabled: boolean
   /** 生效的图片输入支持（已叠加用户 opt-in 与上游 multimodal）。 */
   supportsImages: boolean
-  /** 生效上下文窗口（已叠加用户预算）。 */
+  /** 生效上下文窗口（已叠加用户预算与默认策略）。 */
   contextWindow: number
-  /** 上游宣告的窗口，未叠加预算。 */
+  /** 上游宣告的窗口，未叠加预算（= Max 档；无 Max 时等于 dev 档）。 */
   nativeContextWindow: number
+  /**
+   * 上游宣告的 Max 档窗口。
+   *
+   * 与 `nativeContextWindow` 分开暴露的理由：后者在没有 Max 档时会退化成 dev
+   * 档，卡片无法分辨「上游只给了一档」和「Max 恰好等于 dev」。有了这个字段，
+   * 卡片能准确判断该行是否**可抬升**（有 Max 才有档位可选），也能在
+   * `docs/CONTEXT_OVERFLOW_ROOTCAUSE.md` 那类事故里一眼看出「真实窗口 1M、
+   * 当前只申报了 200K」。
+   */
+  maxContextWindow?: number
+  /**
+   * 该模型可选的全部窗口档位（升序，来自 `context-window.ts` 的
+   * `contextBudgetOptions`）。
+   *
+   * 由宿主算好交给卡片，而不是让卡片自己推：两边算法漂移会造出「卡片给一个
+   * 窗口、宿主却拒绝应用」的静默失效控件。卡片把这些值渲染成输入框的
+   * `datalist` 建议（`<input list=...>`），用户仍可填任意合法预算——档位是
+   * 上游真实提供的档位，不是白名单（见 `catalog.ts` 的 `applyModelBudget`）。
+   * 只有一档时不渲染建议列表，输入框保持自由输入。
+   */
+  budgetOptions?: readonly number[]
   /** 上游宣告的单次输出上限。 */
   maxOutputTokens?: number
   /** 上游宣告的推理档位。 */

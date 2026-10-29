@@ -18,6 +18,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { TraeAccount, TraeAccountPool } from './pool.ts'
 import type { TraeCatalog, TraeModelInfo } from './catalog.ts'
+import { contextBudgetOptions } from './context-window.ts'
 import type { TraeCreditsSnapshot, TraeUpstreamClient } from './upstream.ts'
 import type { AutomationStatus, AutomationJobState, AutomationAccountEarnings } from './scheduler.ts'
 import {
@@ -293,6 +294,9 @@ function toCheckin(status: {
 
 /** 模型行 → 卡片形状。 */
 function toWebModel(model: TraeModelInfo, enabled: boolean): TraePoolWebModel {
+  // 档位在这里算好交给卡片，而不是让卡片自己推：两边算术漂移会造出「卡片给
+  // 一个窗口、宿主却拒绝应用」的静默失效控件（见 context-window.ts 模块头）。
+  const options = contextBudgetOptions(model)
   return {
     id: model.id,
     name: model.name,
@@ -302,6 +306,13 @@ function toWebModel(model: TraeModelInfo, enabled: boolean): TraePoolWebModel {
     contextWindow: model.contextWindow,
     // 上游宣告的窗口（未叠加预算）：卡片要能显示「你把它从 1M 压到了 128K」。
     nativeContextWindow: model.maxContextWindow ?? model.contextWindow,
+    // Max 档单独暴露：nativeContextWindow 在没有 Max 时会退化成 dev 档，卡片
+    // 无法分辨「上游只给了一档」和「Max 恰好等于 dev」。
+    ...model.maxContextWindow === undefined ? {} : { maxContextWindow: model.maxContextWindow },
+    // 档位建议值：卡片渲染成输入框的 datalist。只有一档（上游只宣告了 dev）时
+    // 没有可建议的档位，索性不传，输入框保持自由输入——比渲染一个「只有一项的
+    // 单选组」更诚实。
+    ...options.length === 0 ? {} : { budgetOptions: options },
     ...model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens },
     ...model.supportedEfforts === undefined ? {} : { supportedEfforts: model.supportedEfforts },
   }
@@ -335,7 +346,16 @@ function emptyAutomation(): TraePoolWebAutomation {
   }
 }
 
-/** 读取保存的模型选择（分区键优先，legacy 平键兜底）。 */
+/**
+ * 读取保存的模型选择（分区键优先，legacy 平键兜底）。
+ *
+ * 三态的折叠规则必须与宿主 `applySelection`（index.ts）**逐字一致**，否则卡片
+ * 会把「全部启用」画成「全部停用」：
+ * - 分区内的空数组是用户显式「全部停用」，原样返回；
+ * - legacy 平键的空数组/空对象是 `z.array().default([])` 的**未配置**默认值，
+ *   必须折成缺失，否则卡片每一行都显示未勾选，而 DSH 实际提供全部模型 ——
+ *   一个与事实相反的控件。
+ */
 function savedSelection(config: Record<string, unknown>, region: TraePoolRegion): TraePoolWebModelSelection {
   const sectionKey = region === 'cn' ? 'modelSelectionCn' : 'modelSelectionGlobal'
   const section = config[sectionKey]
@@ -345,13 +365,15 @@ function savedSelection(config: Record<string, unknown>, region: TraePoolRegion)
   const pick = <T>(key: string, legacy: unknown): T[] | undefined => {
     const value = source[key]
     if (Array.isArray(value)) return value as T[]
-    if (Array.isArray(legacy)) return legacy as T[]
+    // legacy 平键的空列表代表「从未配置」，不是「全部停用」。
+    if (Array.isArray(legacy) && legacy.length > 0) return legacy as T[]
     return undefined
   }
   const enabled = pick<string>('enabledModelIds', config['enabledModelIds'])
   const images = pick<string>('imageModelIds', config['imageModelIds'])
   const rawBudgets = source['contextBudgets'] ?? config['contextBudgets']
   const budgets = typeof rawBudgets === 'object' && rawBudgets !== null && !Array.isArray(rawBudgets)
+    && Object.keys(rawBudgets as Record<string, unknown>).length > 0
     ? rawBudgets as Record<string, number>
     : undefined
   return {
@@ -417,7 +439,11 @@ export async function buildTraePoolWebStatus(
 
   const catalog = deps.catalogs[region]
   const selection = savedSelection(config, region)
-  const enabled = new Set(selection.enabledModelIds ?? [])
+  // 三种状态必须分开：缺失 = 全部启用；空数组 = 用户显式全部停用；否则看集合。
+  // 旧实现 `enabled.size === 0 || enabled.has(id)` 把空数组当成「全部启用」，
+  // 于是卡片上每个复选框都勾着，而用户明明一个都没选——正是「启用/停用是摆设」
+  // 的客户端成因。
+  const enabled = selection.enabledModelIds === undefined ? undefined : new Set(selection.enabledModelIds)
 
   const schedulerStatus = deps.scheduler?.()
   const automation: TraePoolWebAutomation = schedulerStatus === undefined
@@ -449,7 +475,10 @@ export async function buildTraePoolWebStatus(
       ? {}
       : { preferredAccountId: readPreferredAccountId(deps.pool) },
     cooling: rows.filter(row => row.cooling).length,
-    models: catalog.visible().map(model => toWebModel(model, enabled.size === 0 || enabled.has(model.id))),
+    // 卡片列的是**全量**模型（catalog.all），不是 DSH 实际提供的那份：被停用的
+    // 行必须仍然可见、仍然可勾选，否则停用最后一个模型后整个区块消失，用户再也
+    // 没有入口把它勾回来。`enabled` 逐行给出真实状态（缺失 = 全部启用）。
+    models: catalog.all().map(model => toWebModel(model, enabled === undefined || enabled.has(model.id))),
     selection,
     distribution: deps.pool.currentDistribution(),
     shim: deps.shim?.(region) ?? { running: false },

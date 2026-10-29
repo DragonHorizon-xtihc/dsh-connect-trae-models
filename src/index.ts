@@ -87,11 +87,27 @@ function unwrapVolatileDeep<T>(value: T): T {
  * 每个字段都刻意可选：缺失字段保留其文档语义（「全部启用」/「跟随上游图片
  * 标记」/「不设上限」），而从没保存过的区域保持缺失，让 applyConfigFromSource
  * 能回退到 legacy 平键。
+ *
+ * **每个字段都必须显式 `.default(undefined)`，这不是冗余。** schemastery 给
+ * `array` 隐式 `meta.default = []`、给 `dict` 隐式 `meta.default = {}`，而
+ * `object` resolver 会对每个 dict 字段递归 resolve 缺失值（`property()` →
+ * `Schema.resolve(undefined, field)` → 取 `field.meta.default`）。于是**从未
+ * 保存过**的 `modelSelectionCn` 会被解析成
+ * `{ enabledModelIds: [], imageModelIds: [], contextBudgets: {} }`：
+ * catalog 里精心设计的三态（缺失 = 全部启用 / 部分列表 / `[]` = 全部停用）
+ * 在配置入口处就被压成了「全部停用」，`visible()` 过滤掉每一个模型，DSH 的
+ * 模型选择器于是**一个模型都没有**（2026-10-29 实测：patch 里根本没有
+ * `modelSelectionCn`，而 status 路由回读出的 selection 是
+ * `{"enabledModelIds":[],...}`）。显式把默认值钉成 `undefined` 才能让
+ * 「缺失」真的以缺失的形态到达 `applySelection`。
  */
 const modelSelectionSchema = z.object({
-  enabledModelIds: z.array(z.string()).description('该区域选择器中启用的模型 id（缺失 = 全部）'),
-  imageModelIds: z.array(z.string()).description('该区域接受图片输入的模型 id（缺失 = 跟随上游）'),
-  contextBudgets: z.dict(z.number().step(1).min(1)).description('该区域按模型的上下文窗口覆盖值'),
+  enabledModelIds: z.array(z.string()).default(undefined as never)
+    .description('该区域选择器中启用的模型 id（缺失 = 全部）'),
+  imageModelIds: z.array(z.string()).default(undefined as never)
+    .description('该区域接受图片输入的模型 id（缺失 = 跟随上游）'),
+  contextBudgets: z.dict(z.number().step(1).min(1)).default(undefined as never)
+    .description('该区域按模型的上下文窗口覆盖值'),
 })
 
 /**
@@ -286,16 +302,18 @@ export function apply(ctx: Context, config: TraePoolConfig = {} as TraePoolConfi
     const legacyEnabled = live.enabledModelIds
     const legacyImages = live.imageModelIds
     const legacyBudgets = live.contextBudgets
-    // 区域槽位里出现的**空列表**与「缺失」同义，一律折成缺省（不过滤）。
-    // 设置 schema 会把「从未配置」materialize 成 `[]`，卡片保存也会写回当前
-    // 勾选集；把 `[]` 原样传下去会让 visible() 过滤掉全部模型——那正是配置
-    // 界面看不到任何可选模型的成因。丢失选择必须退化为「不筛选」，绝不能
-    // 退化为「一个都不要」。
+    // 三态语义（`undefined` / 部分列表 / `[]`）绝不能再折叠：折叠 `[]` 会让
+    // 「全部停用」在服务端永远不生效，配置卡片的复选框就沦为纯装饰——这正是
+    // 用户报的「启用/停用是摆设」。
+    //
+    // 分区槽位**缺失**时才回退 legacy 平键（老设置文件只有平键）。legacy 平键
+    // 是 `asVolatile(z.array(z.string()).default([]))`，空数组在那里代表「从未
+    // 配置」而不是「全部停用」，所以 legacy 的空列表仍折成缺省。
     core.catalogs[region].applySelection({
-      ...selection?.enabledModelIds === undefined || selection.enabledModelIds.length === 0
+      ...selection?.enabledModelIds === undefined
         ? legacyEnabled === undefined || legacyEnabled.length === 0 ? {} : { enabledModelIds: legacyEnabled }
         : { enabledModelIds: selection.enabledModelIds },
-      ...selection?.imageModelIds === undefined || selection.imageModelIds.length === 0
+      ...selection?.imageModelIds === undefined
         ? legacyImages === undefined || legacyImages.length === 0 ? {} : { imageModelIds: legacyImages }
         : { imageModelIds: selection.imageModelIds },
       ...selection?.contextBudgets === undefined
@@ -612,12 +630,16 @@ export function apply(ctx: Context, config: TraePoolConfig = {} as TraePoolConfi
 
     // 账本持久化：调度器把当天账本写回 settings，启动时读回旧账本（更早日期的
     // 会被丢弃）。写失败绝不能打断调度器本身。
+    //
+    // 这里的 `.bind` 与卡片侧 `settingsWriter` 同理：`settings.update` 是类方法，
+    // 脱离实例调用会让函数体首行的 `this.write` 抛 TypeError，账本于是一条也存
+    // 不下来（表现为每次重启「今日收益」清空）。
     core.scheduler.setEarningsPersistence(ledger => {
       const writer = settingsService === undefined
         ? undefined
         : (settingsService as unknown as {
           update?: (ns: string, patch: Record<string, unknown>) => Promise<void> | void
-        }).update
+        }).update?.bind(settingsService)
       if (typeof writer !== 'function') return
       void Promise.resolve(writer(settingsWriteNs, { automationEarnings: ledger })).catch(
         (error: unknown) => { ctx.logger.warn('dsh-connect-trae-models: 自动化账本写入失败', error) },
@@ -635,11 +657,19 @@ export function apply(ctx: Context, config: TraePoolConfig = {} as TraePoolConfi
   //
   // 挂宿主同源 web server。`webServer` 是可选服务，所以用 `ctx.inject` 而不是直接
   // 取：无头 profile 上这些路由根本不挂，卡片退化成离线横幅，provider 照常服务。
+  //
+  // **必须 `.bind(settingsService)`。** `settings.update` 是 `SettingsForms` 的
+  // 类方法，函数体第一行就是 `await this.write(ns, …)`；而 `ctx.settings` 取回的
+  // 是服务实例本身（cordis 的 reflect handler 只做 `getTraceable`，不 bind 方法），
+  // 所以解构出来的 `update` 一旦被独立调用，`this` 就是 `undefined`，随即以
+  // 「Cannot read properties of undefined (reading 'write')」500 —— 这正是
+  // 「全选后保存模型配置无效」的根因：任何字段、任何区域都写不进去，patch 里
+  // 于是永远没有 `modelSelectionCn`（2026-10-29 实测复现）。
   const settingsWriter = settingsService === undefined
     ? undefined
     : (settingsService as unknown as {
       update?: (ns: string, patch: Record<string, unknown>) => Promise<void> | void
-    }).update
+    }).update?.bind(settingsService)
 
   /**
    * 把一次卡片写入落到 settings。
@@ -832,10 +862,13 @@ export {
 export type { ShimLogger, TraePoolShim, TraePoolShimOptions } from './shim.ts'
 // adapter（T5）：pi-ai 路由装配。
 export {
+  configuredMaxTokensFor,
   createTraeAdapter,
   POOL_NAME_BY_REGION,
   POOL_PROVIDER_BY_REGION,
+  safeOutputReservation,
   TRAE_GLOBAL_POOL_PROVIDER,
+  TRAE_MIN_MESSAGE_BUDGET_TOKENS,
   TRAE_POOL_PROVIDER,
   TRAE_STREAM_IDLE_TIMEOUT_MS,
 } from './adapter.ts'

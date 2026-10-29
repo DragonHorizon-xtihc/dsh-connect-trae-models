@@ -10,6 +10,15 @@
 
 import type { TraeDiscoveredModel } from './model-metadata.ts'
 import type { TraeRegion } from './region.ts'
+import {
+  contextBudgetOptions,
+  defaultContextWindow,
+  effectiveContextWindow,
+  resolveContextBudget,
+  TRAE_DEFAULT_CONTEXT_WINDOW,
+} from './context-window.ts'
+
+export { TRAE_DEFAULT_CONTEXT_WINDOW }
 
 /** 模型的一种输入模态。 */
 export type TraeInputModality = 'text' | 'image'
@@ -24,6 +33,15 @@ export interface TraeModelInfo {
   name: string
   /** 生效上下文窗口。目录保证必有正值：DSH 拒绝无窗口模型会拖垮整条 provider 路由。 */
   contextWindow: number
+  /**
+   * 上游宣告的 dev 档窗口。
+   *
+   * `contextWindow` 会被用户预算覆盖，而**档位列表必须从 dev 档算起**——否则
+   * 用户把 1M 压到 128K 之后，卡片只能看到 `[128K, 500K, 1M]` 里的后两档，
+   * 「回到 dev 档」这个选项就消失了。缺省表示「`contextWindow` 就是 dev 档」
+   * （未叠加预算时的常态）。
+   */
+  devContextWindow?: number
   /** 单次输出的 token 上限；上游目录偶有缺省。 */
   maxOutputTokens?: number
   /** 积分倍率（折后价，如 0.08 → 「 · x0.08」）。 */
@@ -45,11 +63,11 @@ export interface TraeModelInfo {
 }
 
 /**
- * 目录保证的默认窗口。两个来源（远端目录/get_detail_param）都没报窗口的
- * 罕见模型用它兜底：没有窗口的模型会让 DSH 整条 provider 路由
- * `INVALID_MODEL_CONTEXT` 失败，比一个不精确的窗口严重得多。
+ * 目录保证的默认窗口。
+ *
+ * 定义搬到 `context-window.ts`（浏览器半端也要用同一份算术），这里保留导出以
+ * 维持既有公开 API：`index.ts` 与测试都从本模块取它。
  */
-export const TRAE_DEFAULT_CONTEXT_WINDOW = 200_000
 
 /**
  * CN 回退名册（照抄 dsh-connect-trae catalog.ts，字段已实测核对）：
@@ -189,15 +207,28 @@ export type TraeContextBudget = number
 
 /**
  * 应用单个模型的上下文预算。
- * 规则：预算必须落在 (0, 广告窗口上限] 内——上限 = maxContextWindow（若有）
- * 否则当前窗口。可以下调，也可以上调到上游真实宣告的 Max 档，但绝不虚构数值。
+ *
+ * 规则全部收敛在 `context-window.ts`（宿主与卡片共用同一份算术）：
+ * - 合法预算（正整数且不宽于该模型的 Max 档）→ 用预算；
+ * - 未设置或非法 → 默认策略（{@link defaultContextWindow}）。
+ *
+ * **默认策略本身就是一次抬升**：带 1M Max 档的模型默认申报 500K，带 272K Max
+ * 的模型默认申报 272K，绝不再无条件钉死在 dev 档的 200K。这是本次 silent
+ * overflow 事故的正解——旧实现只能在 `maxContextWindow ?? contextWindow` 以内
+ * 下调，而 Max 档因解析门槛恒为 undefined，于是「20 万硬顶、必死」。
+ *
+ * 档位列表（`contextBudgetOptions`）是**建议值**，不是白名单：合法预算只要不宽于
+ * Max 档就照用（例如用户填 300000，即便它不在 `[200000, 500000, 1000000]` 里），
+ * 因为预算的本意是「在这台机器上少花 token」，收窄永远安全；危险方向是超出
+ * 上游真实窗口，而那由 {@link resolveContextBudget} 夹到 Max 档拦下。
  */
 export function applyModelBudget(model: TraeModelInfo, budget: number | undefined): TraeModelInfo {
-  if (budget === undefined || !Number.isFinite(budget) || budget <= 0) return model
-  const ceiling = model.maxContextWindow ?? model.contextWindow
-  const window = Math.max(1, Math.min(Math.floor(budget), ceiling))
+  // dev 档必须记住**未叠加预算时**的窗口：`contextWindow` 即将被预算改写，而
+  // 档位列表要从 dev 档算起，否则「回到 dev 档」这个选项会随预算一起消失。
+  const dev = model.devContextWindow ?? model.contextWindow
+  const window = effectiveContextWindow({ ...model, devContextWindow: dev }, budget)
   if (window === model.contextWindow) return model
-  return { ...model, contextWindow: window }
+  return { ...model, contextWindow: window, devContextWindow: dev }
 }
 
 /** 模型目录：live 数据 + 静态回退 + 用户选择。 */
@@ -230,34 +261,43 @@ export class TraeCatalog {
   }
 
   /**
-   * DSH 实际应提供的模型：套用用户选择——停用的模型剔除，显式图片列表与上游
-   * multimodal 标志并集决定图片输入，逐模型预算调整窗口。
+   * 目录里**全部**模型，套用图片 opt-in 与上下文预算，但**不按启用列表过滤**。
    *
-   * 与蓝本 dsh-workbuddy-xdpool 的语义一致：`enabledModelIds` **缺失** = 全部
-   * 可见；空数组则是「用户撤回了每一个模型」这一显式选择，必须照办——所以这里
-   * 不能把空数组也放宽成不筛选。
+   * 这是配置卡片要的数据源：卡片必须能列出「已被停用的行」，否则用户勾掉最后
+   * 一个模型后整个模型区块会连同复选框一起消失，再也没有入口把它勾回来——
+   * 一个只能单向关闭的控件。真正交给 DSH 的仍然是 {@link visible}。
+   */
+  all(): readonly TraeModelInfo[] {
+    const images = this.selection.imageModelIds
+    const imageSet = images === undefined ? undefined : new Set(images)
+    const budgets = this.selection.contextBudgets
+    return this.models.map(model => {
+      let next = { ...model }
+      if (imageSet !== undefined) next.supportsImages = next.supportsImages || imageSet.has(model.id)
+      // 上游自己宣告 multimodal 的模型即使没有 opt-in 也接受图片：
+      // Trae IDE 的附件按钮就只看这个标志。
+      if (model.multimodal === true) next.supportsImages = true
+      next = applyModelBudget(next, budgets?.[model.id])
+      return next
+    })
+  }
+
+  /**
+   * DSH 实际应提供的模型：套用用户选择——停用的模型剔除。
    *
-   * 真正要防的是空数组被**无意写入**：schema 会把「从未配置」materialize 成
-   * `[]`，那会让模型选择器整个空掉。防它的是写入侧的兜底（见 index.ts 的
-   * applySelection 与卡片保存），不是在这里放宽过滤。
+   * 语义严格区分三种状态（三者不可互相折叠，折叠任何一对都会造出一个撒谎的
+   * 控件，见 `docs/CONTEXT_OVERFLOW_ROOTCAUSE.md` 的同名小节）：
+   * - **缺失** = 用户从未选过 → 全部提供（新安装绝不能给空选择器）；
+   * - **部分列表** = 只提供列表里的；
+   * - **空数组** = 用户显式停用了每一个 → 一个都不提供，必须照办。
+   *
+   * 历史教训：旧实现把空数组也放宽成「不筛选」，于是「全部停用」在服务端根本
+   * 无法生效；同时卡片渲染的是过滤后的列表，两者叠加让停用变成纯装饰。
    */
   visible(): readonly TraeModelInfo[] {
     const enabled = this.selection.enabledModelIds
     const allow = enabled === undefined ? undefined : new Set(enabled)
-    const images = this.selection.imageModelIds
-    const imageSet = images === undefined ? undefined : new Set(images)
-    const budgets = this.selection.contextBudgets
-    return this.models
-      .filter(model => allow === undefined || allow.has(model.id))
-      .map(model => {
-        let next = { ...model }
-        if (imageSet !== undefined) next.supportsImages = next.supportsImages || imageSet.has(model.id)
-        // 上游自己宣告 multimodal 的模型即使没有 opt-in 也接受图片：
-        // Trae IDE 的附件按钮就只看这个标志。
-        if (model.multimodal === true) next.supportsImages = true
-        next = applyModelBudget(next, budgets?.[model.id])
-        return next
-      })
+    return this.all().filter(model => allow === undefined || allow.has(model.id))
   }
 
   /** 替换目录并通知 adapter 重建模型列表。空列表忽略（绝不接受空目录）。 */

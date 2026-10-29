@@ -24,8 +24,23 @@ export interface TraeDiscoveredModel {
   id: string
   name: string
   multimodal: boolean
+  /** dev 档窗口（`context_window_tokens.dev`）。 */
   contextWindow?: number
+  /**
+   * Max 档窗口（`context_window_tokens.max`）。
+   *
+   * **只要有值就解析出来，与 `max_mode` 无关。** 曾经这里用
+   * `raw.max_mode === true` 做门槛，导致上游在 `max_mode: false` 时宣告的 1M
+   * 窗口被静默丢弃，目录退化成 dev 档，最终由 pi-ai 的 silent-overflow 判定
+   * 把成功的响应判成溢出（`docs/CONTEXT_OVERFLOW_ROOTCAUSE.md`）。
+   */
   maxContextWindow?: number
+  /**
+   * `max_mode` 原始标志：它只描述「该 Max 档是否可计费使用」，**不是窗口存在
+   * 与否的门槛**。保留它是为了不把这条上游信息悄悄丢掉，窗口值本身永远走
+   * {@link maxContextWindow}。
+   */
+  maxMode?: boolean
   creditMultiplier?: number
   reasoningSupported: boolean
   reasoning?: TraeDiscoveredReasoning
@@ -69,7 +84,12 @@ export function parseTraeRemoteModel(value: unknown): TraeDiscoveredModel | unde
   if (raw === undefined || typeof raw.name !== 'string' || raw.name === '') return undefined
   const context = record(raw.context_window_tokens)
   const dev = finitePositive(context?.['dev'])
-  const max = raw.max_mode === true ? finitePositive(context?.['max']) : undefined
+  // 窗口值与 `max_mode` 解耦：`max_mode` 说的是「Max 档是否可计费使用」，不是
+  // 「上游有没有宣告 Max 档」。以前的 `raw.max_mode === true` 门槛把上游宣告
+  // 的 1M 窗口整段丢掉，直接造成 silent-overflow 误判（见模块 JSDoc 与
+  // docs/CONTEXT_OVERFLOW_ROOTCAUSE.md）。
+  const max = finitePositive(context?.['max'])
+  const maxMode = raw.max_mode === true
   const features = parseFeatures(raw.features)
   const consumption = record(features?.['consumption_rate'])
   const consumptionData = record(consumption?.['data'])
@@ -92,6 +112,7 @@ export function parseTraeRemoteModel(value: unknown): TraeDiscoveredModel | unde
     multimodal: raw.multimodal === true,
     ...dev === undefined ? {} : { contextWindow: dev },
     ...max === undefined ? {} : { maxContextWindow: max },
+    ...maxMode ? { maxMode } : {},
     ...creditMultiplier === undefined ? {} : { creditMultiplier },
     reasoningSupported,
     ...supported.length === 0 ? {} : { reasoning: { supported, ...defaultEffort === undefined ? {} : { defaultEffort } } },

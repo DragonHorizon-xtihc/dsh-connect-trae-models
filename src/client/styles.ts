@@ -113,6 +113,10 @@ export const POOL_CARD_CSS = `
 .dsm-connect-trae-models-section-title{margin:0;color:var(--dsw-alias-label-primary,#e6e6e6);font-size:14px;font-weight:600;line-height:20px}
 .dsm-connect-trae-models-section-hint{margin:0;color:var(--dsw-alias-label-tertiary,#9aa0a8);font-size:12px;line-height:18px}
 
+/* 模型批量勾选条：全选 / 取消全选 + 当前状态。 */
+.dsm-connect-trae-models-model-bulk{align-items:center;gap:8px;flex-wrap:wrap;display:flex}
+.dsm-connect-trae-models-model-bulk-state{color:var(--dsw-alias-label-tertiary,#9aa0a8);font-size:12px;line-height:18px}
+
 /* 账号行。 */
 .dsm-connect-trae-models-account{border:1px solid var(--dsw-alias-border-l2,#36373b);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
 .dsm-connect-trae-models-account-head{align-items:center;gap:10px;flex-wrap:wrap;display:flex}

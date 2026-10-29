@@ -392,6 +392,97 @@ describe('模型管理', () => {
     expect((screen.getByLabelText(`row.modelBudget GLM-5.2`) as HTMLInputElement).disabled).toBe(true)
     expect(screen.getByText(/row.modelsReadonly/)).toBeTruthy()
   })
+
+  it('全选把所有行勾上', async () => {
+    await renderCard(statusDocument({ models, selection: { enabledModelIds: ['glm-5.2'] } }))
+
+    // 初始：只有 GLM-5.2 勾着。
+    expect((screen.getByLabelText(`row.modelEnabled Gemini-3.1-Pro`) as HTMLInputElement).checked).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: /row.modelsSelectAll/ }))
+
+    expect((screen.getByLabelText(`row.modelEnabled GLM-5.2`) as HTMLInputElement).checked).toBe(true)
+    expect((screen.getByLabelText(`row.modelEnabled Gemini-3.1-Pro`) as HTMLInputElement).checked).toBe(true)
+  })
+
+  it('取消全选把所有行清空，且保存时原样落盘空数组（不静默变全选）', async () => {
+    const { calls } = await renderCard(
+      statusDocument({ models, selection: { enabledModelIds: ['glm-5.2', 'gemini-3.1-pro'] } }),
+      { answers: { [TRAE_POOL_MODELS_SAVE_PATH]: { body: { ok: true } } } },
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /row.modelsSelectNone/ }))
+    expect((screen.getByLabelText(`row.modelEnabled GLM-5.2`) as HTMLInputElement).checked).toBe(false)
+    expect((screen.getByLabelText(`row.modelEnabled Gemini-3.1-Pro`) as HTMLInputElement).checked).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: /row.modelsSave/ }))
+    await waitFor(() => {
+      expect(calls.some(call => call.url.startsWith(TRAE_POOL_MODELS_SAVE_PATH))).toBe(true)
+    })
+
+    // 旧实现会在这里把空选集展开成「全部模型 id」，让取消全选 + 保存静默变成全选。
+    const save = calls.find(call => call.url.startsWith(TRAE_POOL_MODELS_SAVE_PATH))!
+    expect((save.body as { enabledModelIds: string[] }).enabledModelIds).toEqual([])
+  })
+
+  it('全部停用时给出明确提示（不再是一个隐形的空区块）', async () => {
+    await renderCard(statusDocument({ models, selection: { enabledModelIds: [] } }))
+
+    expect(screen.getByText(/row.modelsAllDisabled/)).toBeTruthy()
+    // 关键：行必须还在，用户才能勾回来。
+    expect(screen.getByLabelText(`row.modelEnabled GLM-5.2`)).toBeTruthy()
+  })
+
+  it('批量状态文案是三态：部分启用时不能谎称「全部模型已启用」', async () => {
+    // 两个模型里只启用一个 —— 旧实现用 anyEnabled 二值化，会在这里显示
+    // 「全部模型已启用。」，与用户看到的「一行没勾」直接矛盾。
+    await renderCard(statusDocument({ models, selection: { enabledModelIds: ['glm-5.2'] } }))
+
+    expect(screen.queryByText(/row.modelsAllEnabled/)).toBeNull()
+    expect(screen.queryByText(/row.modelsAllDisabled/)).toBeNull()
+    const partial = screen.getByText(/row.modelsSomeEnabled/)
+    expect(partial.textContent).toContain('"enabled":1')
+    expect(partial.textContent).toContain('"total":2')
+  })
+
+  it('全部启用时批量状态显示「全部模型已启用」', async () => {
+    await renderCard(statusDocument({ models, selection: { enabledModelIds: ['glm-5.2', 'gemini-3.1-pro'] } }))
+
+    expect(screen.getByText(/row.modelsAllEnabled/)).toBeTruthy()
+  })
+
+  it('预算输入把上游档位渲染成 datalist 建议值', async () => {
+    const withOptions = [
+      { ...models[0], budgetOptions: [200_000, 500_000, 1_000_000], maxContextWindow: 1_000_000, nativeContextWindow: 1_000_000 },
+    ]
+    await renderCard(statusDocument({ models: withOptions }))
+
+    const input = screen.getByLabelText(`row.modelBudget GLM-5.2`) as HTMLInputElement
+    // list 属性把输入框绑到 datalist，用户能直接选 200K / 500K / 1M。
+    const listId = input.getAttribute('list')
+    expect(listId).toBeTruthy()
+    const datalist = document.getElementById(listId!)!
+    const values = [...datalist.querySelectorAll('option')].map(option => option.getAttribute('value'))
+    expect(values).toEqual(['200000', '500000', '1000000'])
+  })
+
+  it('没有档位可选时不渲染 datalist（自由输入，而不是只有一项的单选）', async () => {
+    await renderCard(statusDocument({ models }))
+
+    const input = screen.getByLabelText(`row.modelBudget GLM-5.2`) as HTMLInputElement
+    expect(input.getAttribute('list')).toBeNull()
+  })
+
+  it('预算输入的下限与服务端对齐（1000），不再允许 1 token', async () => {
+    await renderCard(statusDocument({ models }))
+
+    const input = screen.getByLabelText(`row.modelBudget GLM-5.2`) as HTMLInputElement
+    expect(input.min).toBe('1000')
+    expect(input.step).toBe('1000')
+    // 输入 1 → 被抬到下限 1000，避免「前端看着生效、保存时被 400 拒绝」。
+    fireEvent.change(input, { target: { value: '1' } })
+    expect(input.value).toBe('1000')
+  })
 })
 
 describe('自动化面板', () => {

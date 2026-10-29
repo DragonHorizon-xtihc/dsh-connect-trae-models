@@ -39,6 +39,19 @@ import type {
 import type { TraePoolSettingsKey } from './locales.ts'
 import { POOL_CARD_CSS } from './styles.ts'
 
+/** 卡片允许的最小上下文预算（token）。
+ *
+ * 必须与服务端 `parseSelection` 的下限 1000 一致：前端若允许更小的值，用户会
+ * 看到「输入生效」却在保存时被 400 拒绝。低于这个量级的窗口 DSH 也会以
+ * `INVALID_MODEL_CONTEXT` 拒绝，本来就没有意义。
+ */
+const MIN_CONTEXT_BUDGET = 1000
+
+/** 某个模型行的预算建议列表 id（`<input list>` 与 `<datalist id>` 共用）。 */
+function budgetListId(modelId: string): string {
+  return `trae-budget-options-${modelId}`
+}
+
 /** 卡片渲染所需的注入面。 */
 export interface TraePoolCardInjected {
   t: (key: TraePoolSettingsKey, params?: Record<string, unknown>) => string
@@ -299,6 +312,8 @@ export function TraePoolCard(props: TraePoolCardProps) {
   const effectiveDraft = useMemo(() => {
     if (draft !== undefined) return draft
     const selection = status?.selection
+    // 服务端逐行给出的 `enabled` 已经是三态解析后的真实状态（缺失 = 全部启用、
+    // `[]` = 全部停用），所以这里直接照抄即可，不需要再判断空数组。
     const enabled = models.filter(model => model.enabled).map(model => model.id)
     const images = models.filter(model => model.supportsImages).map(model => model.id)
     const budgets: Record<string, number> = {}
@@ -312,21 +327,44 @@ export function TraePoolCard(props: TraePoolCardProps) {
     }
   }, [draft, status, models])
 
+  /** 当前草稿里被启用的模型数（用于批量勾选条的三态文案）。 */
+  const enabledCount = useMemo(() => {
+    const ids = new Set(effectiveDraft.enabledModelIds)
+    return models.filter(model => ids.has(model.id)).length
+  }, [effectiveDraft, models])
+
+  /** 当前草稿里是否有任何一个模型被启用。 */
+  const anyEnabled = enabledCount > 0
+
   const setDraft = useCallback((next: typeof effectiveDraft): void => {
     setModelDraft(current => ({ ...current, [activeRegion]: next }))
   }, [activeRegion])
 
+  /** 全选：把全量模型都写进启用列表（而不是留空表示「全部启用」）。 */
+  const selectAllModels = useCallback((): void => {
+    setDraft({ ...effectiveDraft, enabledModelIds: models.map(model => model.id) })
+  }, [setDraft, effectiveDraft, models])
+
+  /**
+   * 取消全选：落成**显式空数组**。
+   *
+   * `[]` 与「缺失」是两件事：缺失 = 全部启用，`[]` = 用户逐个停用。只有写空
+   * 数组才能表达「一个都不要」，所以这里绝不能退化成删键。
+   */
+  const selectNoModels = useCallback((): void => {
+    setDraft({ ...effectiveDraft, enabledModelIds: [] })
+  }, [setDraft, effectiveDraft])
+
   const saveModels = useCallback(async (): Promise<void> => {
-    // 空勾选集绝不能落盘：`enabledModelIds: []` 在读取侧是「用户撤回了每一个
-    // 模型」这一显式选择，会让模型选择器整个空掉——而用户真正想表达的往往是
-    // 「还没挑」。因此保存时把空选展开成当前全部模型 id，与参照插件一致
-    // （它用 `selection.enabledModelIds ?? 全部已启用 id`）。
-    const enabledIds = effectiveDraft.enabledModelIds.length > 0
-      ? effectiveDraft.enabledModelIds
-      : models.map(model => model.id)
+    // 原样保存勾选集，包括空数组。
+    //
+    // 旧实现在这里把空选集展开成「全部模型 id」，理由是「空选集会让选择器整个
+    // 空掉」。但空选集本来就是用户的合法选择（全部停用），而且卡片现在列的是
+    // 全量模型，停用后随时能勾回来。展开成全部 id 只会让「取消全选 + 保存」
+    // 静默变成「全选」，让这个按钮变成摆设。
     const payload = await post(TRAE_POOL_MODELS_SAVE_PATH, {
       region: activeRegion,
-      enabledModelIds: enabledIds,
+      enabledModelIds: effectiveDraft.enabledModelIds,
       imageModelIds: effectiveDraft.imageModelIds,
       contextBudgets: effectiveDraft.contextBudgets,
     }, 'models')
@@ -334,7 +372,7 @@ export function TraePoolCard(props: TraePoolCardProps) {
       setNotice(t('row.modelsSaved'))
       reloadConfig()
     }
-  }, [post, activeRegion, effectiveDraft, models, t, reloadConfig])
+  }, [post, activeRegion, effectiveDraft, t, reloadConfig])
 
   /**
    * 切换账号使用方式（写 settings，不走 HTTP 路由）。
@@ -694,6 +732,33 @@ export function TraePoolCard(props: TraePoolCardProps) {
           </h3>
           <p className="dsm-connect-trae-models-section-hint">{t('row.modelsHint')}</p>
           {!modelsEditable && <p className="dsm-connect-trae-models-section-hint">{t('row.modelsReadonly')}</p>}
+          {models.length > 0 && (
+            <div className="dsm-connect-trae-models-model-bulk">
+              <button
+                type="button"
+                className="dsm-btn dsm-btn-secondary"
+                disabled={!modelsEditable || enabledCount === models.length}
+                onClick={selectAllModels}
+              >
+                {t('row.modelsSelectAll')}
+              </button>
+              <button
+                type="button"
+                className="dsm-btn dsm-btn-secondary"
+                disabled={!modelsEditable || !anyEnabled}
+                onClick={selectNoModels}
+              >
+                {t('row.modelsSelectNone')}
+              </button>
+              <span className="dsm-connect-trae-models-model-bulk-state">
+                {enabledCount === 0
+                  ? t('row.modelsAllDisabled')
+                  : enabledCount === models.length
+                    ? t('row.modelsAllEnabled')
+                    : t('row.modelsSomeEnabled', { enabled: enabledCount, total: models.length })}
+              </span>
+            </div>
+          )}
           {models.map(model => (
             <ModelRow
               key={model.id}
@@ -986,6 +1051,8 @@ function ModelRow(props: {
   onBudgetChange: (next: number | undefined) => void
 }) {
   const { t, model, enabled, images, budget, disabled, onToggleEnabled, onToggleImages, onBudgetChange } = props
+  // 有档位建议才挂 datalist；没有就完全自由输入（`list` 与 `<datalist>` 必须同生同灭）。
+  const hasBudgetOptions = model.budgetOptions !== undefined && model.budgetOptions.length > 0
 
   return (
     <div className="dsm-connect-trae-models-model">
@@ -1029,8 +1096,12 @@ function ModelRow(props: {
           <input
             type="number"
             aria-label={`${t('row.modelBudget')} ${model.name}`}
-            min={1}
+            // list 与 datalist 必须同生同灭：只挂 list 却渲染不出 datalist 会留下一个
+            // 指向不存在 id 的悬空引用（浏览器会静默忽略，但断言与可访问性都说不清）。
+            {...hasBudgetOptions ? { list: budgetListId(model.id) } : {}}
+            min={MIN_CONTEXT_BUDGET}
             max={model.nativeContextWindow}
+            step={1000}
             placeholder={t('row.modelBudgetPlaceholder', { native: model.nativeContextWindow })}
             value={budget === undefined ? '' : String(budget)}
             disabled={disabled}
@@ -1040,9 +1111,18 @@ function ModelRow(props: {
               const parsed = Number(raw)
               if (!Number.isFinite(parsed) || parsed <= 0) return
               // 上限是上游宣告的原生窗口：预算可以下调，绝不虚构到窗口之上。
-              onBudgetChange(Math.min(Math.floor(parsed), model.nativeContextWindow))
+              // 下限与服务端 `parseSelection` 的 1000 对齐，避免「输入 1 token 看着
+              // 生效、保存时才被 400 拒绝」。
+              onBudgetChange(Math.max(MIN_CONTEXT_BUDGET, Math.min(Math.floor(parsed), model.nativeContextWindow)))
             }}
           />
+          {/* 上游真实提供的档位（dev / 500K / Max）。用 datalist 而不是单选按钮：
+              档位是「建议值」，用户仍可填任意合法预算（服务端只夹上下界）。 */}
+          {hasBudgetOptions && (
+            <datalist id={budgetListId(model.id)}>
+              {model.budgetOptions!.map(option => <option key={option} value={option} />)}
+            </datalist>
+          )}
         </label>
       </div>
     </div>

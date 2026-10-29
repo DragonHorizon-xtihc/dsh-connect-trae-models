@@ -80,6 +80,12 @@
   卡片「模型管理」区逐模型显示 `x{倍率}`，`multiplier === 0` 的显示「免费」。
 - **模型管理**：逐模型开关「启用」、打开「图像输入」、设「上下文预算」（上限只能是上游
   宣告的原生窗口，**绝不虚构更大的数**）。保存只影响当前区域，另一个标签页各自一份。
+- **上下文窗口按上游档位如实申报**：Trae 给每个模型宣告两档——dev（通常 200K/256K/272K）
+  与 Max（通常 1M）。插件不再把窗口钉死在 200K，而是按以下默认策略选档：
+  无 Max 档 → 用 dev；Max ≤ 500K → 直接用 Max；Max > 500K（如 1M）→ 默认取 500K
+  （保守默认，想要完整 1M 可在卡片上显式选 Max 档）。卡片会在「上下文预算」输入框给出
+  `dev / 500K(若适用) / Max` 三个建议档位，任何比 Max 更宽的预算都会被夹回 Max，
+  绝不向上游或 DSH 虚报窗口。
 - **上下文窗口**每个模型都必有值——缺了会让 DSH 以 `INVALID_MODEL_CONTEXT` 拖垮整条路由。
 
 ### 四、积分包到期提醒
@@ -123,7 +129,7 @@ dsh plugin --profile desktop add /absolute/path/to/dsh-connect-trae-models
 **方式三：从 Git 仓库安装**
 
 ```sh
-dsh plugin --profile desktop add github:<owner>/dsh-connect-trae-models
+dsh plugin --profile desktop add github:DragonHorizon-xtihc/dsh-connect-trae-models
 ```
 
 也接受 `gitlab:` / `bitbucket:` / `gist:` 简写、完整 git URL、`https://` 仓库地址，
@@ -148,7 +154,7 @@ Web / TUI profile 同样可用（`--profile web` / `--profile dsh-tui`）。
 npx pnpm@11 install --config.confirmModulesPurge=false --config.minimumReleaseAge=0
 pnpm build        # tsdown：lib/index.js（宿主 ESM）+ lib/client.js（浏览器 CJS）
 pnpm typecheck    # 宿主侧 + 客户端侧 tsc --noEmit
-pnpm test         # vitest run，322 项
+pnpm test         # vitest run，377 项
 ```
 
 > **改了 `src/` 记得重新 `pnpm build`**——`lib/` 是提交物，用户拿到的是构建产物，不是源码。

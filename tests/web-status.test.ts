@@ -327,7 +327,14 @@ describe('buildTraePoolWebStatus 文档组装', () => {
     catalogs.cn.update([
       { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 128_000, maxContextWindow: 1_000_000, multiplier: 0.08, supportsImages: false, maxOutputTokens: 64_000, supportedEfforts: ['low', 'high'] },
     ])
-    const status = await buildTraePoolWebStatus(deps({ catalogs }), 'cn')
+    // 用户显式把 1M 档压到 128K：卡片要能同时给出「生效窗口」和「上游宣告的
+    // 窗口」，否则用户看不出自己被压窄了。预算由宿主 applySelection 落到目录上
+    // （index.ts 的接线），status 只负责把已生效的行渲染出来。
+    catalogs.cn.applySelection({ contextBudgets: { 'glm-5.2': 128_000 } })
+    const status = await buildTraePoolWebStatus(deps({
+      catalogs,
+      config: () => ({ modelSelectionCn: { contextBudgets: { 'glm-5.2': 128_000 } } }),
+    }), 'cn')
 
     expect(status.models[0]).toMatchObject({
       id: 'glm-5.2',
@@ -335,9 +342,25 @@ describe('buildTraePoolWebStatus 文档组装', () => {
       multiplier: 0.08,
       contextWindow: 128_000,
       nativeContextWindow: 1_000_000,
+      maxContextWindow: 1_000_000,
       maxOutputTokens: 64_000,
       enabled: true,
     })
+    // 档位列表由宿主算好交给卡片（dev / 500K / Max），卡片不自己推。
+    expect(status.models[0]?.budgetOptions).toEqual([128_000, 500_000, 1_000_000])
+  })
+
+  it('未设置预算时模型行申报默认策略窗口（1M Max 档 → 500K，不再钉死 dev）', async () => {
+    const catalogs = { cn: new TraeCatalog('cn'), ai: new TraeCatalog('ai') }
+    catalogs.cn.update([
+      { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', contextWindow: 200_000, maxContextWindow: 1_000_000, supportsImages: false },
+    ])
+    const status = await buildTraePoolWebStatus(deps({ catalogs }), 'cn')
+
+    // 这正是 silent overflow 事故的正解：默认申报 500K 而不是 dev 的 200K。
+    expect(status.models[0]?.contextWindow).toBe(500_000)
+    expect(status.models[0]?.nativeContextWindow).toBe(1_000_000)
+    expect(status.models[0]?.budgetOptions).toEqual([200_000, 500_000, 1_000_000])
   })
 
   it('目录来源与失败原因随文档给出（fallback 是可解释的降级）', async () => {
@@ -476,6 +499,54 @@ describe('buildTraePoolWebStatus 文档组装', () => {
       config: () => ({ enabledModelIds: ['kimi-k2.6'] }),
     }), 'cn')
     expect(legacy.selection.enabledModelIds).toEqual(['kimi-k2.6'])
+  })
+
+  // 这一组是「启用/停用只是摆设」的回归保护。三种状态绝不可折叠：
+  //   缺失 = 全部启用；部分列表 = 只启用列表内；空数组 = 全部停用。
+  // 旧实现把空数组当「全部启用」（`enabled.size === 0 || has(id)`），于是用户
+  // 一个都没勾，卡片上却每行都勾着。
+  it('enabledModelIds 缺失 = 全部启用，且每行都报 enabled:true', async () => {
+    const status = await buildTraePoolWebStatus(deps(), 'cn')
+    expect(status.selection.enabledModelIds).toBeUndefined()
+    expect(status.models.length).toBeGreaterThan(0)
+    expect(status.models.every(model => model.enabled)).toBe(true)
+  })
+
+  // 回归保护：legacy 平键的空数组是 `z.array().default([])` 的「未配置」默认值，
+  // 不是「全部停用」。旧实现 `if (Array.isArray(legacy)) return legacy` 直接把它
+  // 当成显式空列表，于是从未配置过的用户在卡片上看到每一行都未勾选，而 DSH 实际
+  // 提供全部模型 —— 一个与事实相反的控件。
+  it('legacy 空数组 = 未配置（全部启用），不能读成「全部停用」', async () => {
+    const status = await buildTraePoolWebStatus(deps({
+      config: () => ({ enabledModelIds: [], imageModelIds: [], contextBudgets: {} }),
+    }), 'cn')
+
+    expect(status.selection).toEqual({})
+    expect(status.models.length).toBeGreaterThan(0)
+    expect(status.models.every(model => model.enabled)).toBe(true)
+  })
+
+  it('enabledModelIds 为空数组 = 全部停用（每行 enabled:false，但行仍然要列出来）', async () => {
+    const status = await buildTraePoolWebStatus(deps({
+      config: () => ({ modelSelectionCn: { enabledModelIds: [] } }),
+    }), 'cn')
+
+    // 关键断言：空数组不再被当成「全部启用」。
+    expect(status.selection.enabledModelIds).toEqual([])
+    expect(status.models.length).toBeGreaterThan(0)
+    expect(status.models.some(model => model.enabled)).toBe(false)
+    // 行仍然必须存在：卡片靠这些行把模型勾回来。如果这里退化成空列表，
+    // 「全部停用」就会变成一个不可逆操作——区块消失、没有入口再勾选。
+    expect(status.models.length).toBe(FALLBACK_TRAE_MODELS.length)
+  })
+
+  it('卡片列出的是全量模型：被停用的行不消失', async () => {
+    const status = await buildTraePoolWebStatus(deps({
+      config: () => ({ modelSelectionCn: { enabledModelIds: ['glm-5.2'] } }),
+    }), 'cn')
+
+    expect(status.models.length).toBe(FALLBACK_TRAE_MODELS.length)
+    expect(status.models.filter(model => model.enabled).map(model => model.id)).toEqual(['glm-5.2'])
   })
 })
 

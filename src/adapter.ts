@@ -103,6 +103,57 @@ function modelInput(info: TraeModelInfo): ('text' | 'image')[] {
   return info.supportsImages ? ['text', 'image'] : ['text']
 }
 
+/**
+ * 一次路由请求必须为「模型自己的输出」留出的最少消息预算（token）。
+ *
+ * 为什么需要这条下限：`dsh-compaction-basic` 的 `resolveCompactSpec()` 用
+ * `reservedCompletionTokens`（= 本插件写进 `configuredMaxTokens` 的值）从窗口里
+ * 先扣掉输出预留，再扣 `headroomTokens`（默认 65536）得到压力预算，而保留区
+ * `retainTokens = floor(0.16 × (window − reserved))` 必须**小于**压力预算，否则
+ * 它直接抛 `TargetPressureConfigError`，压缩一次都不会发生 —— 那正是本次事故
+ * 里「零 compaction 事件」的现象之一。
+ *
+ * 代入默认参数解这条不等式：`0.84 × (window − reserved) > 65536`，即消息预算
+ * 至少要 78,019。取整到 100,000 留出余量，同时足够宽松：200K 窗口 + 64K 输出
+ * （136K 消息预算）、272K + 72K（200K）、500K + 128K（372K）全部通过；只有
+ * 「输出预留吃掉大半个窗口」的荒谬组合（如 200K + 128K）才会被跳过 —— 跳过时
+ * 退回事故前的行为（不预留、不抛错），绝不制造新的失败模式。
+ */
+export const TRAE_MIN_MESSAGE_BUDGET_TOKENS = 100_000
+
+/**
+ * 该模型可以在 `configuredMaxTokens` 里声明多少输出预留。
+ *
+ * `undefined` = 不声明（`dsh-llm` 的 `info.defaultMaxTokens` 保持缺失，
+ * compaction 的 `reservedCompletionTokens` 回落到 0，与修复前一致）。
+ *
+ * 导出是为了让测试直接覆盖这条「预留不能压垮压缩算术」的判定，而不必装配整个
+ * pi-ai adapter（那需要真实的 shim 端口）。
+ */
+export function safeOutputReservation(info: Pick<TraeModelInfo, 'maxOutputTokens'>, contextWindow: number): number | undefined {
+  const max = info.maxOutputTokens
+  if (typeof max !== 'number' || !Number.isInteger(max) || max <= 0) return undefined
+  return contextWindow - max >= TRAE_MIN_MESSAGE_BUDGET_TOKENS ? max : undefined
+}
+
+/**
+ * 目录行 → `configuredMaxTokens` 映射（`dsh-llm` 的 `info.defaultMaxTokens`）。
+ *
+ * 纯函数 + 独立导出：adapter 只负责在每次目录变化时调用它，测试则可以直接断言
+ * 「哪个模型被声明了输出预留、预留是多少」，不必起 shim。
+ */
+export function configuredMaxTokensFor(models: readonly TraeModelInfo[]): Map<string, number> {
+  const map = new Map<string, number>()
+  for (const info of models) {
+    const contextWindow = Number.isFinite(info.contextWindow) && info.contextWindow > 0
+      ? info.contextWindow
+      : TRAE_DEFAULT_CONTEXT_WINDOW
+    const reservation = safeOutputReservation(info, contextWindow)
+    if (reservation !== undefined) map.set(info.id, reservation)
+  }
+  return map
+}
+
 /** 只映射目录宣告的档位；DSH 未宣告的档位保持关闭。 */
 function thinkingLevelMap(info: TraeModelInfo): Record<string, string | null> | undefined {
   const efforts = info.supportedEfforts
@@ -166,6 +217,11 @@ function withCatalogDisplay(name: string, info: TraeModelInfo): string {
  * `contextWindow` 必须有值：DSH 对无窗口模型会以 `INVALID_MODEL_CONTEXT`
  * 失败，而那会拖垮**整条** provider 路由 —— 比一个不精确的窗口严重得多。
  * 目录保证每行都有正整数窗口，这里仍兜底一次。
+ *
+ * **窗口语义的唯一解析点是 `TraeCatalog.visible()`**（它套用
+ * `applyModelBudget` → `context-window.ts` 的预算/默认策略）。这里绝不能再跑
+ * 一次 `effectiveContextWindow`：用户把 1M 模型主动压到 128K 之后，重算默认值
+ * 会把选择悄悄推翻成 500K。传入的行一定是已解析的行，本函数只做正值守卫。
  */
 function toPiModel(info: TraeModelInfo, baseUrl: string, providerId: string): Model<Api> {
   const map = thinkingLevelMap(info)
@@ -203,6 +259,25 @@ export function createTraeAdapter(options: TraeAdapterOptions): TraeAdapter {
     return catalog.visible().map(info => toPiModel(info, baseUrl, providerId))
   }
 
+  /**
+   * 组装 `configuredMaxTokens`：目录宣告了单次输出上限的模型，把该值交给
+   * `dsh-llm` 作为 `info.defaultMaxTokens`。
+   *
+   * 为什么必须填（修复 `new Map()` 恒空的后果）：`dsh-compaction-basic` 的
+   * `reservedCompletionTokens(agent, defaultMaxTokens)` 取
+   * `requestHeader().config.maxTokens ?? defaultMaxTokens ?? 0`。这个 map 恒空时
+   * 预留恒为 0，压力阈值被算成整窗（事故里 200000 → threshold 134464），压缩
+   * 与「真实可用消息预算」脱节；同时 `resolveCompactSpec` 的保留区约束完全
+   * 不受输出预留保护。
+   *
+   * 但盲目照抄会引入**新的**整窗错误：若输出预留把消息预算压到小于
+   * `headroomTokens`，`resolveCompactSpec` 会抛 `TargetPressureConfigError`，
+   * 压缩彻底不工作。所以经 {@link configuredMaxTokensFor} 里的
+   * {@link safeOutputReservation} 过滤，只声明不会破坏压缩算术的预留；被过滤掉
+   * 的模型维持修复前行为。
+   */
+  const buildConfiguredMaxTokens = (): Map<string, number> => configuredMaxTokensFor(catalog.visible())
+
   const base = createProvider({
     id: providerId,
     name: displayName,
@@ -223,21 +298,26 @@ export function createTraeAdapter(options: TraeAdapterOptions): TraeAdapter {
 
   const provider: Provider = { ...base, getModels: () => buildModels() }
 
-  const profile: ResolvedPiAiProviderProfile = {
+  /**
+   * 按当前目录构建 profile。每次 `invalidate()` 重建它，让 `configuredMaxTokens`
+   * 跟着目录/预算变化（旧实现把 profile 建成常量，`invalidate()` 只是换了个
+   * 装着同一个对象的 Map —— 输出预留永远停在首帧）。
+   */
+  const buildProfile = (): ResolvedPiAiProviderProfile => ({
     provider: providerId,
     displayName,
     streamIdleTimeoutMs: TRAE_STREAM_IDLE_TIMEOUT_MS,
     retryPolicy: resolveRetryPolicy(undefined, 'dsh-connect-trae-models retryPolicy'),
-    configuredMaxTokens: new Map(),
+    configuredMaxTokens: buildConfiguredMaxTokens(),
     // dsh-llm-pi-ai 要求：宿主 adapter 在每次模型解析时读
     // profile.modelErrors.get(model)。目录来自实时上游，所以没有预知的失败
     // —— 空 map 表示「没有模型被预先拒绝」。
     modelErrors: new Map(),
     ...REQUEST_IMAGE_BUDGETS,
     piProvider: provider,
-  }
+  })
 
-  let profiles = new Map<string, ResolvedPiAiProviderProfile>([[providerId, profile]])
+  let profiles = new Map<string, ResolvedPiAiProviderProfile>([[providerId, buildProfile()]])
 
   const adapter = new PiAiAdapter({
     profiles: () => profiles,
@@ -258,7 +338,7 @@ export function createTraeAdapter(options: TraeAdapterOptions): TraeAdapter {
     adapter,
     buildModels,
     invalidate: () => {
-      profiles = new Map<string, ResolvedPiAiProviderProfile>([[providerId, profile]])
+      profiles = new Map<string, ResolvedPiAiProviderProfile>([[providerId, buildProfile()]])
     },
   }
 }
